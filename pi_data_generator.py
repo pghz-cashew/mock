@@ -17,16 +17,16 @@ def generate_comprehensive_pi_data(start_date=None, end_date=None, frequency='1m
     Generate COMPREHENSIVE and REALISTIC PI Data Export for Crude Oil Separation Train
     
     Parameters:
-    - start_date: Start date (default: 2025-07-31)
-    - end_date: End date (default: 2025-08-03)
-    - frequency: Data frequency - '1min', '5min', '1h', '1D' (default: '1h')
+    - start_date: Start date (default: 2025-07-01)
+    - end_date: End date (default: 2025-07-03)
+    - frequency: Data frequency - '1min', '5min', '1h', '1D' (default: '1min')
     - max_tags: Maximum number of tags to include (default: all)
     - key_tags_only: If True, generate only 8 key tags from mock data (default: False)
     """
     
     logging.info("Starting PI data generation")
     
-    # Set default date range - dates now configurable here
+    # Set default date range
     if start_date is None:
         start_date = datetime(2025, 7, 1, 0, 0, 0)
     if end_date is None:
@@ -99,10 +99,15 @@ def generate_comprehensive_pi_data(start_date=None, end_date=None, frequency='1m
     # Filter events to only include those within the date range
     process_events = [event for event in process_events if event['start'] <= end_date]
     
+    # Initialize state variables
     all_data = []
-    flow_base = {}  # Current flow for correlation
-    prev_flow_base = {}  # Previous for lag
-    controller_values = {}  # Store controllers for valves
+    flow_base = {}
+    prev_flow_base = {}
+    controller_values = {}
+    upset_state = {tag: {'active': False, 'duration': 0, 'multiplier': 1.0} for tag in all_tags}
+    range_drift = {tag: 1.0 for tag in all_tags}
+    volatility_counter = 0
+    volatility_active = False
     
     for timestamp in tqdm(timestamps, desc="Generating PI data"):
         hour = timestamp.hour
@@ -131,11 +136,25 @@ def generate_comprehensive_pi_data(start_date=None, end_date=None, frequency='1m
                 event_factors['bad_prob_mult'] = 4.0
         
         bad_prob = 0.02 * event_factors.get('bad_prob_mult', 1.0)
-        
-        pump_a_down = 'pump_a_down' in event_factors
+        pump_a_down = 'pump_a' in event_factors and event_factors['pump_a'] == 0.0
         if pump_a_down:
             event_factors['pump_b_load'] = 1.2
         
+        # Volatility phase
+        volatility_counter += 1
+        if volatility_counter > random.randint(50, 100):
+            volatility_active = True
+            volatility_duration = random.randint(5, 15)
+            volatility_counter = 0
+        if volatility_active:
+            global_noise_boost = random.uniform(1.5, 3.0)
+            volatility_duration -= 1
+            if volatility_duration <= 0:
+                volatility_active = False
+        else:
+            global_noise_boost = 1.0
+        
+        # Tag loop
         for tag, config in all_tags.items():
             if config.get('type') == 'digital':
                 value = 1
@@ -149,30 +168,48 @@ def generate_comprehensive_pi_data(start_date=None, end_date=None, frequency='1m
                 units = 'status'
             else:
                 min_val, max_val = config['range']
-                base_value = (min_val + max_val) / 2
+                mean_val = (min_val + max_val) / 2
+                range_drift[tag] += np.random.normal(0, 0.01)
+                range_drift[tag] = max(0.7, min(1.3, range_drift[tag]))
+                base_deviation = (max_val - min_val) / 2 * range_drift[tag]
+                base_value = mean_val + np.random.uniform(-base_deviation, base_deviation) * daily_factor * seasonal_factor
                 
-                value = base_value * daily_factor * seasonal_factor
                 if 'trend' in config:
-                    value *= config['trend'] ** days_since_start
+                    base_value *= config['trend'] ** days_since_start
                 
+                # Apply event factors
                 if 'analyzer' in event_factors and 'AT-' in tag:
-                    value *= event_factors['analyzer']
+                    base_value *= event_factors['analyzer']
                 if 'temperature' in event_factors and 'TT-' in tag:
-                    value *= event_factors['temperature']
+                    base_value *= event_factors['temperature']
                 if 'cooling' in event_factors and ('condenser' in config['desc'].lower() or 'cool' in config['desc'].lower()):
-                    value *= event_factors['cooling']
+                    base_value *= event_factors['cooling']
                 if 'control' in event_factors and ('C-' in tag):
-                    value *= event_factors['control']
+                    base_value *= event_factors['control']
                 if 'pump_b_load' in event_factors and 'P-101B' in tag:
-                    value *= event_factors['pump_b_load']
+                    base_value *= event_factors['pump_b_load']
                 
                 if 'FT-201' in prev_flow_base and 'TT-' in tag:
                     prev_flow = prev_flow_base['FT-201']
-                    value *= (1 + 0.05 * (prev_flow - (180 + 250) / 2) / ( (180 + 250) / 2 ))
+                    base_value *= (1 + 0.05 * (prev_flow - (180 + 250) / 2) / ((180 + 250) / 2))
                 
-                noise = np.random.normal(0, config['noise'] * event_factors['noise_mult'])
-                value += noise
-                value = max(0, min(max_val * 1.3, max(min_val * 0.7, value)))
+                # Sudden drops/rises
+                if upset_state[tag]['active']:
+                    base_value *= upset_state[tag]['multiplier']
+                    upset_state[tag]['duration'] -= 1
+                    if upset_state[tag]['duration'] <= 0:
+                        upset_state[tag]['active'] = False
+                elif random.random() < 0.02:
+                    upset_state[tag]['active'] = True
+                    upset_state[tag]['duration'] = random.randint(1, 3)
+                    upset_state[tag]['multiplier'] = random.uniform(0.7, 0.9) if random.random() < 0.5 else random.uniform(1.1, 1.3)
+                
+                # Noise with heavy tails
+                use_heavy_tails = True
+                effective_noise_std = config['noise'] * event_factors['noise_mult'] * global_noise_boost
+                noise = np.random.standard_t(df=3) * effective_noise_std if use_heavy_tails else np.random.normal(0, effective_noise_std)
+                value = base_value + noise
+                value = max(0, min(max_val * 1.4, max(min_val * 0.6, value)))
                 value = round(value, 2)
                 
                 status = 'Good' if random.random() > bad_prob else 'Bad'
@@ -192,16 +229,15 @@ def generate_comprehensive_pi_data(start_date=None, end_date=None, frequency='1m
                 'Units': units,
                 'Status': status
             })
-            
-            if 'FC-' in tag or 'LC-' in tag or 'PC-' in tag or 'TC-' in tag:
-                controller_values[tag] = value
-            if 'FT-' in tag:
-                flow_base[tag] = value
         
+        if 'FC-' in tag or 'LC-' in tag or 'PC-' in tag or 'TC-' in tag:
+            controller_values[tag] = value
+        if 'FT-' in tag:
+            flow_base[tag] = value
+    
         prev_flow_base = flow_base.copy()
     
     df_full = pd.DataFrame(all_data)
-
     print("\n✅ DATASET GENERATION COMPLETE:")
     print(f"   • Total Records: {len(df_full):,}")
     print(f"   • Unique Tags: {df_full['Tag'].nunique()}")
@@ -289,8 +325,8 @@ Frequency: {frequency}
 - **Excel File**: PI_Export_Crude_Separation_{start_date.strftime('%Y%m%d')}_{end_date.strftime('%Y%m%d')}_{frequency}_{len(all_tags)}tags.xlsx
 - **Tabs**:
   - **Raw Data**: Time-series values for each tag (pivot format, Timestamp vs. Tag).
-  - **Trends**: Daily averages and % changes for each tag, useful for tracking changes (e.g., "What's changed since yesterday?" or "How did things run over the weekend?").
-  - **Comparisons**: Analyzer vs. lab samples (every 12 hours) for Light Ends (mol%) and Naphtha RVP (psi), with alignment % and On/Off-Spec status (answers "Are we on specification?").
+  - **Trends**: Daily averages and % changes for each tag, useful for tracking changes.
+  - **Comparisons**: Analyzer vs. lab samples (every 12 hours) for Light Ends (mol%) and Naphtha RVP (psi), with alignment % and On/Off-Spec status.
   - **Tag List**: Full list of tags with descriptions, units, ranges, and criticality.
   - **Process Events**: Events affecting data (e.g., upsets, maintenance) with start/end times and impacts.
   - **Statistics Summary**: Per-tag stats (count, mean, std, min, max, good data %) for data quality analysis.
@@ -339,6 +375,7 @@ Frequency: {frequency}
 - **Data Quality**: Statistics Summary provides Good % per tag; Data Status shows Good/Bad over time.
 """
     
+    # Define file_name and date_str before saving
     date_str = start_date.strftime('%Y%m%d') + '_' + end_date.strftime('%Y%m%d')
     file_name = f"PI_Export_Crude_Separation_{date_str}_{frequency}_{len(all_tags)}tags.xlsx"
     
@@ -354,6 +391,7 @@ Frequency: {frequency}
             df_stats.to_excel(writer, sheet_name='Statistics Summary', index=False)
             df_status.to_excel(writer, sheet_name='Data Status', index=False)
         logging.info(f"Saved Excel: {file_name}")
+        print(f"✅ Saved Excel: {file_name}")
     except (ImportError, Exception) as e:
         print(f"⚠️ Excel save failed ({e}), saving CSV...")
         logging.error(f"Excel save failed: {e}")
@@ -377,8 +415,8 @@ Frequency: {frequency}
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Generate PI data for crude separation')
     parser.add_argument('--start', default=None, help='Start date (YYYY-MM-DD), default: 2025-07-01')
-    parser.add_argument('--end', default=None, help='End date (YYYY-MM-DD), default: 2025-08-03')
-    parser.add_argument('--freq', default=None, help='Data frequency (1min, 5min, 1h, 1D), default: 1min')
+    parser.add_argument('--end', default=None, help='End date (YYYY-MM-DD), default: 2025-07-03')
+    parser.add_argument('--freq', default='1min', help='Data frequency (1min, 5min, 1h, 1D), default: 1min')
     parser.add_argument('--tags', type=int, default=None)
     parser.add_argument('--key-tags-only', action='store_true', help='Generate only 8 key tags')
     args = parser.parse_args()
@@ -403,11 +441,11 @@ if __name__ == "__main__":
             logging.error(f"Invalid end date format: {e}")
             exit(1)
     
+    # Explicitly define frequency with default
+    frequency = args.freq if args.freq else '1min'
+    
     np.random.seed(42)
     random.seed(42)
-    
-    # Handle frequency with proper default
-    frequency = args.freq if args.freq else '1min'  # Use function's default
     
     try:
         df_full, df_trends, df_comparisons = generate_comprehensive_pi_data(
